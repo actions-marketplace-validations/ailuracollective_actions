@@ -1,7 +1,5 @@
 name: 'Pull request policy'
-description: >-
-  Enforce the contribution policy on a pull request: linked issue, type label, title shape and
-  length, and the structure of the description. Reports every finding in one run.
+description: 'Enforce a contribution policy on a pull request: linked issue, type label, title and body. Every finding in one run.'
 author: 'ailuracollective'
 
 # Five checks, one status. The rules are independent, so branch protection can require each — except

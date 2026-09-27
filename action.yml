@@ -1,7 +1,5 @@
 name: 'Branch validation'
-description: >-
-  Require a pull request's head branch to read <github-username>/<type>/<description> and to be
-  owned by the pull request author.
+description: 'Require a pull request''s head branch to read <author>/<type>/<description> and be owned by its author.'
 author: 'ailuracollective'
 
 # The flagship of this hub, and the only position that permits the one-segment path

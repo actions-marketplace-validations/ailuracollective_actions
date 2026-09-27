@@ -1,5 +1,5 @@
 name: 'Pull request template resolver'
-description: 'Resolve the pull request template for a given type at a given git ref, falling back to a default template when the dedicated one is absent.'
+description: 'Resolve the pull request template for a type at a git ref, falling back to a default when none is dedicated.'
 author: 'ailuracollective'
 
 # A thin wrapper. The resolution rule and both of its failure modes live in lib/template.sh,

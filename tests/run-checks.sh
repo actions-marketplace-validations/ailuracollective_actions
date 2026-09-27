@@ -874,6 +874,11 @@ for rel in rels:
     seen.add(name)
     if not desc or not desc[0].isupper():
         problems.append(label + ' description must begin with a capital letter')
+    # Under 125 characters. The Marketplace rejects a longer one at publish time, which is the worst
+    # place to find out: the submission is already filled in when the error appears.
+    flat = ' '.join(desc.split())
+    if len(flat) >= 125:
+        problems.append(label + ' description is %d characters; must be under 125' % len(flat))
     b = d.get('branding')
     if not b:
         problems.append(label + ' has no branding; it cannot be listed in the Marketplace')
