@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Shared helpers for the pull-request-validation checks. Sourced by every check, never executed.
+#
+# The repository's contribution-policy checks run as steps of ONE composite action, so there is a
+# single GitHub check status. Each check therefore records a verdict and exits 0; lib/report.sh
+# runs last, renders every verdict, and is the only thing that fails the job.
+
+# ---------------------------------------------------------------------------------------------
+# Result contract. Written by prv_record, read only by lib/report.sh.
+#
+#   $RESULTS_DIR/<check>.status   exactly one of: pass | fail | skip
+#   $RESULTS_DIR/<check>.msg      one line of human text, verbatim, untrusted characters included
+#
+# One file per field, never a delimited line: a pull request body can contain any delimiter we might
+# pick, and a tab- or pipe-separated status line would be silently misread as extra fields.
+# A check that records nothing leaves no status file, which report.sh reports as `error` — an
+# unexpected crash can never be mistaken for a pass.
+# ---------------------------------------------------------------------------------------------
+: "${RESULTS_DIR:=${RUNNER_TEMP:-/tmp}/prv-results}"
+
+# Name the calling check and make its results directory available. Call first, before any verdict.
+prv_init() {
+  CHECK_NAME=$1
+  export CHECK_NAME
+  mkdir -p "$RESULTS_DIR"
+}
+
+# prv_record <pass|fail|skip> <message...>
+prv_record() {
+  local status=$1
+  shift
+  # The message may span lines; collapse whitespace so the summary table stays one row per check.
+  printf '%s' "$*" | tr '\n' ' ' | tr -d '\r' | sed -E -e 's/[[:space:]]+/ /g' -e 's/^ //' -e 's/ $//' \
+    > "$RESULTS_DIR/$CHECK_NAME.msg"
+  printf '%s' "$status" > "$RESULTS_DIR/$CHECK_NAME.status"
+}
+
+# Percent-escape text destined for a workflow command. Untrusted pull request text reaches
+# `::error` through here; the caller must pass every interpolated value through it.
+prv_escape() {
+  # `%` is escaped FIRST, or the `%` introduced by the later replacements gets escaped in turn.
+  printf '%s' "$1" | sed -e 's/%/%%/g' -e 's/\r/%0D/g' -e 's/\n/%0A/g'
+}
+
+# prv_error <title> <message...> — a failing check's annotation, fully escaped.
+prv_error() {
+  local title=$1
+  shift
+  printf '::error title=%s::%s\n' "$(prv_escape "$title")" "$(prv_escape "$*")"
+}
+
+# prv_note <message...> — a passing check's trace, or an advisory that is not a failure.
+prv_note() {
+  printf '%s\n' "$*"
+}
+
+# prv_warn <message...> — something the consumer should know that does not fail the check.
+prv_warn() {
+  printf '::warning::%s\n' "$(prv_escape "$*")"
+}
+
+# prv_gate <event> [action] — return 0 to proceed, 1 when this check does not apply to the current
+# event. Callers write `prv_gate ... || exit 0`; errexit cannot fire inside that `||` list, so a
+# gated-out check records `skip` and stops without ever reaching a verdict it was not triggered for.
+prv_gate() {
+  local want_event=$1 want_action=${2:-*}
+  if [ "$GITHUB_EVENT_NAME" != "$want_event" ]; then
+    prv_record skip "Not applicable: this check runs on the '$want_event' stream and this job was triggered by '$GITHUB_EVENT_NAME'."
+    return 1
+  fi
+  if [ "$want_action" != '*' ] && [ "$GITHUB_EVENT_ACTION" != "$want_action" ]; then
+    prv_record skip "Not applicable: this check runs on '$want_event' action '$want_action' and this job was triggered by '$GITHUB_EVENT_ACTION'."
+    return 1
+  fi
+  return 0
+}
+
+# prv_csv_lines <value> — a comma-separated input, one trimmed element per line.
+# Empty input must emit nothing rather than one blank line, or `wc -l` and `jq -s` both count 1.
+prv_csv_lines() {
+  local out
+  out=$(printf '%s' "$1" | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d')
+  [ -z "$out" ] || printf '%s\n' "$out"
+}
+
+# prv_allowed_labels <csv> — the same list as a JSON array, for `jq --argjson`.
+prv_allowed_labels() {
+  prv_csv_lines "$1" | jq -R . | jq -s .
+}
+
+# prv_human_list <csv> — the same list, comma-and-space separated, for a human message.
+prv_human_list() {
+  # `paste -sd,` then a substitute: a multi-character `-d` list would cycle its delimiters.
+  prv_csv_lines "$1" | paste -sd, - | sed -e 's/,/, /g'
+}
+
+# prv_matched_type_labels — the pull request's labels that are in the configured type set, original
+# casing, one per line. Matching is case-insensitive because GitHub label names are not. Shared by
+# `type-label` and `pr-body-structure`, which must agree on which label the PR carries.
+prv_matched_type_labels() {
+  local allowed
+  allowed=$(prv_allowed_labels "$INPUT_TYPE_LABELS")
+  # Untrusted labels: one JSON array in, filtered by jq, never interpolated into this script.
+  printf '%s' "$PR_LABELS" | jq -r --argjson allowed "$allowed" \
+    '.[] | select((.name | ascii_downcase) as $n | $allowed | index($n)) | .name'
+}
+
+# prv_valid_linear_identifier <value> — true for a Linear `TEAMKEY-N` identifier.
+# This doubles as the guard that makes splicing the identifier into a JSON payload safe: nothing
+# outside the class can carry a quote, a backslash or a control character.
+prv_valid_linear_identifier() {
+  printf '%s' "$1" | grep -qE '^[A-Za-z][A-Za-z0-9]*-[0-9]+$'
+}

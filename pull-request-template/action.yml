@@ -1,0 +1,75 @@
+name: 'Pull request template resolver'
+description: 'Resolve the pull request template for a given type at a given git ref, falling back to a default template when the dedicated one is absent.'
+author: 'ailuracollective'
+
+# A thin wrapper. The resolution rule and both of its failure modes live in lib/template.sh,
+# which the root action's pr-body-structure check also sources, so the two surfaces cannot drift.
+# `${{ github.action_path }}` is this subdirectory, so `../..` is the repository root — the whole repo
+# is downloaded at a tag, which is what makes the relative path resolve for a consumer.
+#
+# The rule is not inlined here on purpose: a second copy of it would be a second thing to keep
+# correct, and this action's steps were never executed by the test harness before the extraction.
+
+inputs:
+  type:
+    description: 'PR type label, e.g. "feat". Resolved to <template-dir>/<type>.md.'
+    required: true
+  ref:
+    description: 'Git ref to read the template at. Empty resolves to the PR base sha on a pull_request event, then to the event sha. Pin it explicitly for any other use.'
+    required: false
+    default: ''
+  repo:
+    description: 'Repository holding the template, as owner/repo. Empty uses the current repository.'
+    required: false
+    default: ''
+  template-dir:
+    description: 'Directory holding the per-type templates.'
+    required: false
+    default: '.github/PULL_REQUEST_TEMPLATE'
+  default-template:
+    description: 'Template used when the dedicated one is absent.'
+    required: false
+    default: '.github/PULL_REQUEST_TEMPLATE.md'
+  fail-on-missing:
+    description: 'Fail the step when neither the dedicated nor the default template exists. "true" or "false".'
+    required: false
+    default: 'false'
+
+outputs:
+  path:
+    description: 'Resolved template path, repository-relative. Set even when the file does not exist.'
+    value: ${{ steps.resolve.outputs.path }}
+  source:
+    description: 'Either "dedicated" or "default", telling which rule matched. "none" when neither template was read.'
+    value: ${{ steps.resolve.outputs.source }}
+  found:
+    description: '"true" when the resolved template exists at the resolved ref, "false" otherwise.'
+    value: ${{ steps.resolve.outputs.found }}
+  ref:
+    description: 'The ref actually read, after the fallback chain.'
+    value: ${{ steps.resolve.outputs.ref }}
+  file:
+    description: 'Local path of the downloaded template, or empty when nothing was found.'
+    value: ${{ steps.resolve.outputs.file }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve the pull request template
+      id: resolve
+      shell: bash
+      env:
+        INPUT_TYPE: ${{ inputs.type }}
+        INPUT_REF: ${{ inputs.ref }}
+        INPUT_REPO: ${{ inputs.repo != '' && inputs.repo || github.repository }}
+        INPUT_TEMPLATE_DIR: ${{ inputs.template-dir }}
+        INPUT_DEFAULT_TEMPLATE: ${{ inputs.default-template }}
+        INPUT_FAIL_ON_MISSING: ${{ inputs.fail-on-missing }}
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        RUNNER_TEMP: ${{ runner.temp }}
+        GITHUB_OUTPUT: ${{ env.GITHUB_OUTPUT }}
+        # Untrusted-to-this-action inputs are read quoted, never spliced into the script.
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        EVENT_SHA: ${{ github.sha }}
+      run: bash ${{ github.action_path }}/resolve.sh

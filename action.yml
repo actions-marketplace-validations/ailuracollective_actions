@@ -1,0 +1,52 @@
+name: 'Branch validation'
+description: >-
+  Require a pull request's head branch to read <github-username>/<type>/<description> and to be
+  owned by the pull request author.
+author: 'ailuracollective'
+
+# The flagship of this hub, and the only position that permits the one-segment path
+# `uses: ailuracollective/actions@v1`. One check, deliberately: the other contribution-policy checks
+# are separate actions, because a consumer that only wants branch naming should not have to opt out
+# of five others, and should not need a token at all.
+
+inputs:
+  branch-types:
+    description: Comma-separated type segments accepted in a branch name.
+    required: false
+    default: 'feat,fix,chore,docs,style,refactor,perf,test,build,ci,revert'
+  github-token:
+    description: Token used for every API call. Defaults to the workflow's own token.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: 'composite'
+  steps:
+    # Records a verdict and exits 0; `continue-on-error` is what keeps a crash from skipping the rest,
+    # and the report step is what actually fails the job. Without aggregation a single check status
+    # would cost the author one push per defect.
+    - name: Branch name
+      continue-on-error: true
+      shell: bash
+      env:
+        RESULTS_DIR: ${{ runner.temp }}/prv-results
+        INPUT_BRANCH_TYPES: ${{ inputs.branch-types }}
+        HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        # The PR AUTHOR, not the head ref owner: for a fork PR they are different people.
+        AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+      run: bash ${{ github.action_path }}/branch-name.sh
+
+    - name: Report
+      # `always()`: the report must render even when the check crashed, and a step that failed under
+      # `continue-on-error` would otherwise skip every step after it.
+      if: always()
+      shell: bash
+      env:
+        RESULTS_DIR: ${{ runner.temp }}/prv-results
+        GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        PRV_TITLE: 'Branch validation'
+        PRV_CHECKS: 'branch-name'
+        PRV_LABELS: 'Branch name'
+        PRV_NOTE: 'This check runs on `opened` only. GitHub cannot rename a branch an open pull request points at, so `head.ref` is fixed for the life of the pull request; re-validating it on every event would spend runner minutes re-deriving a fact that cannot have changed.'
+      run: bash ${{ github.action_path }}/lib/report.sh

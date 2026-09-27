@@ -1,0 +1,150 @@
+name: 'Pull request policy'
+description: >-
+  Enforce the contribution policy on a pull request: linked issue, type label, title shape and
+  length, and the structure of the description. Reports every finding in one run.
+author: 'ailuracollective'
+
+# Five checks, one status. The rules are independent, so branch protection can require each — except
+# that a composite action cannot, which is why the run reports all five at once and the job summary
+# carries the table. Branch naming is a separate action, at the repository root.
+
+inputs:
+  enable-linked-issue:
+    description: Require a closing keyword in the PR body pointing at an issue that carries the approved label.
+    required: false
+    default: 'true'
+  enable-type-label:
+    description: Require exactly one of the allowed type labels on the PR.
+    required: false
+    default: 'true'
+  enable-title-length:
+    description: Require the PR title to fall inside the character window.
+    required: false
+    default: 'true'
+  enable-title-conventional:
+    description: Require the PR title to be a Conventional Commit subject.
+    required: false
+    default: 'true'
+  enable-body-structure:
+    description: Require every section declared by the type template to be present in the PR body.
+    required: false
+    default: 'true'
+  title-min:
+    description: Minimum PR title length, in characters.
+    required: false
+    default: '15'
+  title-max:
+    description: Maximum PR title length, in characters.
+    required: false
+    default: '72'
+  type-labels:
+    description: Comma-separated type labels, used for the label check, the Conventional Commit subject grammar and template resolution.
+    required: false
+    default: 'feat,fix,docs,refactor,chore,style,perf,test,build,ci,revert,breaking-change'
+  template-dir:
+    description: Directory holding the per-type PR templates.
+    required: false
+    default: '.github/PULL_REQUEST_TEMPLATE'
+  default-template:
+    description: PR template used for a type that has no dedicated template.
+    required: false
+    default: '.github/PULL_REQUEST_TEMPLATE.md'
+  approved-label:
+    description: Label a linked GitHub issue must carry for the PR to pass.
+    required: false
+    default: 'status:approved'
+  linked-issue-sources:
+    description: 'Comma-separated sources the closing reference may point at: `github` for #N, `linear` for TEAMKEY-N.'
+    required: false
+    default: 'github'
+  linear-approved-label:
+    description: Label a linked Linear issue must carry for the PR to pass.
+    required: false
+    default: 'approved'
+  github-token:
+    description: Token used for every API call. Defaults to the workflow's own token.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Linked issue
+      if: inputs.enable-linked-issue == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        RESULTS_DIR: ${{ runner.temp }}/prv-results
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        INPUT_APPROVED_LABEL: ${{ inputs.approved-label }}
+        INPUT_LINKED_ISSUE_SOURCES: ${{ inputs.linked-issue-sources }}
+        INPUT_LINEAR_APPROVED_LABEL: ${{ inputs.linear-approved-label }}
+        # A secret, not an input: a `with:` value is echoed into the step's rendered command, an env
+        # value is not. Read straight from the environment so the caller passes it as a secret.
+        LINEAR_API_KEY: ${{ env.LINEAR_API_KEY }}
+        # Untrusted body: passed through the environment, never spliced into a script.
+        PR_BODY: ${{ github.event.pull_request.body }}
+      run: bash ${{ github.action_path }}/linked-issue.sh
+
+    - name: Type label
+      if: inputs.enable-type-label == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        RESULTS_DIR: ${{ runner.temp }}/prv-results
+        INPUT_TYPE_LABELS: ${{ inputs.type-labels }}
+        # Untrusted labels: one JSON array, filtered with jq inside the script.
+        PR_LABELS: ${{ toJSON(github.event.pull_request.labels) }}
+      run: bash ${{ github.action_path }}/type-label.sh
+
+    - name: Title length
+      if: inputs.enable-title-length == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        RESULTS_DIR: ${{ runner.temp }}/prv-results
+        INPUT_TITLE_MIN: ${{ inputs.title-min }}
+        INPUT_TITLE_MAX: ${{ inputs.title-max }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+      run: bash ${{ github.action_path }}/pr-title-length.sh
+
+    - name: Title follows Conventional Commits
+      if: inputs.enable-title-conventional == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        RESULTS_DIR: ${{ runner.temp }}/prv-results
+        INPUT_TYPE_LABELS: ${{ inputs.type-labels }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+      run: bash ${{ github.action_path }}/pr-title-conventional.sh
+
+    - name: Body structure
+      if: inputs.enable-body-structure == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        RESULTS_DIR: ${{ runner.temp }}/prv-results
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        # Base branch, never the PR head: on a fork pull request `github.sha` is attacker-controlled,
+        # and a job holding a token must not put untrusted fork code on the runner.
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+        PR_LABELS: ${{ toJSON(github.event.pull_request.labels) }}
+        INPUT_TYPE_LABELS: ${{ inputs.type-labels }}
+        INPUT_TEMPLATE_DIR: ${{ inputs.template-dir }}
+        INPUT_DEFAULT_TEMPLATE: ${{ inputs.default-template }}
+      run: bash ${{ github.action_path }}/pr-body-structure.sh
+
+    - name: Report
+      if: always()
+      shell: bash
+      env:
+        RESULTS_DIR: ${{ runner.temp }}/prv-results
+        GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        PRV_TITLE: 'Pull request policy'
+        PRV_CHECKS: 'linked-issue|type-label|pr-title-length|pr-title-conventional|pr-body-structure'
+        PRV_LABELS: 'Linked issue|Type label|Title length|Title is conventional|Body structure'
+      run: bash ${{ github.action_path }}/../lib/report.sh

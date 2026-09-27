@@ -1,0 +1,109 @@
+#!/usr/bin/env node
+'use strict';
+
+// Minimal `jq` shim for tests/run-checks.sh, because jq is not installed on every machine that runs
+// the harness. It implements ONLY the two filters the checks actually use and exits nonzero on
+// anything else, so an unimplemented filter can never silently let a test pass.
+//
+// It is NOT validated against real jq. A divergence between this shim and real jq would show up as
+// a test that disagrees with the runner, not as a test that fails.
+
+let args = process.argv.slice(2);
+let rawInput = false;
+let slurp = false;
+let stringOutput = false;
+let argjson = {};
+let filter = null;
+let files = [];
+
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === '-R' || a === '--raw-input') rawInput = true;
+  else if (a === '-s' || a === '--slurp') slurp = true;
+  else if (a === '-r' || a === '--raw-output') stringOutput = true;
+  else if (a === '-n' || a === '--null-input') { /* not used */ }
+  else if (a === '--argjson') { argjson[args[++i]] = args[++i]; }
+  else if (a.startsWith('-')) fail(`unsupported option ${a}`);
+  else if (filter === null) filter = a;
+  else files.push(a);
+}
+
+if (files.length) fail('file arguments are not used by the checks');
+if (filter === null) fail('no filter given');
+
+function fail(message) {
+  process.stderr.write(`jq-shim: ${message}\n`);
+  process.exit(2);
+}
+
+let input = '';
+try {
+  input = require('fs').readFileSync(0, 'utf8');
+} catch (e) {
+  fail('could not read stdin');
+}
+
+const LABEL_FILTER = '.[] | select((.name | ascii_downcase) as $n | $allowed | index($n)) | .name';
+const LINEAR_ISSUE_FILTER = '.data.issue';
+const LINEAR_LABELS_FILTER = '.data.issue.labels.nodes[].name';
+const IDENTITY = '.';
+
+function emit(value) {
+  // Real jq -r prints objects and arrays as JSON, and only scalars bare. String() would render an
+  // object as "[object Object]", which would make a found issue indistinguishable in a comparison.
+  const bare = stringOutput && (value === null || typeof value !== 'object');
+  process.stdout.write((bare ? String(value) : JSON.stringify(value)) + '\n');
+}
+
+if (rawInput) {
+  // One JSON string per input line. A trailing newline is a terminator, not an empty final line.
+  const lines = input.length === 0 ? [] : input.replace(/\n$/, '').split('\n');
+  if (filter !== IDENTITY) fail(`unsupported filter with -R: ${filter}`);
+  for (const line of lines) emit(line);
+  process.exit(0);
+}
+
+if (slurp) {
+  if (filter !== IDENTITY) fail(`unsupported filter with -s: ${filter}`);
+  const values = input.trim() === '' ? [] : input.trim().split('\n').filter((l) => l !== '').map((l) => JSON.parse(l));
+  emit(values);
+  process.exit(0);
+}
+
+if (filter === IDENTITY) {
+  emit(JSON.parse(input));
+  process.exit(0);
+}
+
+if (filter === LABEL_FILTER) {
+  const allowed = JSON.parse(argjson.allowed);
+  if (!Array.isArray(allowed)) fail('--argjson allowed is not an array');
+  const labels = JSON.parse(input);
+  if (!Array.isArray(labels)) fail('input is not a JSON array of labels');
+  for (const label of labels) {
+    if (label === null || typeof label.name !== 'string') fail('label entry has no string .name');
+    // Real jq's `index` returns null for a miss, which `select` treats as false.
+    if (allowed.includes(label.name.toLowerCase())) emit(label.name);
+  }
+  process.exit(0);
+}
+
+if (filter === LINEAR_ISSUE_FILTER) {
+  const payload = JSON.parse(input);
+  if (payload.errors) {
+    process.stderr.write('jq-shim: GraphQL errors present\n');
+    process.exit(5);
+  }
+  emit(payload.data ? payload.data.issue : null);
+  process.exit(0);
+}
+
+if (filter === LINEAR_LABELS_FILTER) {
+  const payload = JSON.parse(input);
+  const issue = payload.data ? payload.data.issue : null;
+  if (issue === null || issue === undefined) process.exit(0);
+  for (const node of issue.labels.nodes) emit(node.name);
+  process.exit(0);
+}
+
+fail(`unsupported filter: ${filter}`);

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# `curl` stub for tests/run-checks.sh. Answers the Linear GraphQL call from a canned file.
+#
+#   LINEAR_STUB_RESPONSE   path to a JSON body to serve; unset means `{"data":{"issue":null}}`
+#   LINEAR_STUB_HTTP       status to report (default 200); 000 models an unreachable host
+#   LINEAR_STUB_CAPTURE    path to write the request payload to, so a test can inspect it
+#
+# It honours `-o <file>`, `-w '%{http_code}'` and `--data <body>`, because the check relies on that
+# split: the response body goes to the file and only the status reaches stdout.
+set -uo pipefail
+
+body_out=''
+payload=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) body_out=${2:-}; shift 2 ;;
+    -w) shift 2 ;;                       # only ever '%{http_code}' here
+    -X | -H) shift 2 ;;                 # method, header
+    --data) payload=${2:-}; shift 2 ;;  # the GraphQL request, as an argument not on stdin
+    --data=*) payload=${1#--data=}; shift ;;
+    -H*) shift ;;
+    *) shift ;;
+  esac
+done
+
+if [ -n "${LINEAR_STUB_CAPTURE:-}" ]; then
+  printf '%s' "$payload" > "$LINEAR_STUB_CAPTURE"
+fi
+
+status=${LINEAR_STUB_HTTP:-200}
+
+if [ "$status" = '000' ]; then
+  # A transport failure is a distinct outcome from an HTTP error: the check names them differently.
+  # Real curl exits non-zero here, and the check turns that into "could not be reached".
+  echo "curl: (6) Could not resolve host: api.linear.app" >&2
+  exit 6
+fi
+
+if [ "$status" = '200' ]; then
+  if [ -n "${LINEAR_STUB_RESPONSE:-}" ] && [ -f "$LINEAR_STUB_RESPONSE" ]; then
+    body=$(cat "$LINEAR_STUB_RESPONSE")
+  else
+    body='{"data":{"issue":null}}'
+  fi
+else
+  body='{"errors":[{"message":"Authentication failed"}]}'
+fi
+
+if [ -n "$body_out" ]; then printf '%s' "$body" > "$body_out"
+else printf '%s' "$body"; fi
+
+# Without `--fail`, which the check does not pass, a 4xx is a successful transfer carrying a status
+# code. Exiting non-zero here would make the check report "could not be reached" for an auth
+# rejection, hiding the diagnosis it exists to give.
+printf '%s' "$status"
+exit 0

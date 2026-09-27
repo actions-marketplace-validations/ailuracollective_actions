@@ -1,0 +1,17 @@
+# Local Pi runtime state
+.atl/
+
+# ODD process documents. They record how the action was built; they are not part of what a consumer
+# pulls when they reference a tag, and they would only add noise to the published tree.
+odd/
+
+# Editor and OS cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Logs and scratch output
+*.log

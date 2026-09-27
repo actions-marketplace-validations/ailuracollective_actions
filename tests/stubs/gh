@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# `gh` stub for tests/run-checks.sh. Never touches the network; every response is driven by env.
+#
+#   GH_STUB_REPO_ROOT       directory served by `gh api .../contents/<path>`
+#   GH_STUB_ISSUE_LABELS    comma-separated labels returned for `gh api repos/…/issues/<n>`
+#   GH_STUB_ISSUE_API       `ok` (default) | `missing` | `403`
+#   GH_STUB_ISSUE_EDIT      `ok` (default) | `403` | `fail`
+set -uo pipefail
+
+args=("$@")
+
+is_contents_read() {
+  local a
+  for a in "${args[@]}"; do
+    case $a in
+      */contents/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+is_issue_read() {
+  local a
+  for a in "${args[@]}"; do
+    case $a in
+      */issues/[0-9]*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# `gh issue edit <n> --repo <r> --add-label <l>`
+if [ "${args[0]:-}" = 'issue' ] && [ "${args[1]:-}" = 'edit' ]; then
+  case ${GH_STUB_ISSUE_EDIT:-ok} in
+    ok) exit 0 ;;
+    403)
+      echo 'HTTP 403: Resource not accessible by integration (graphQL)' >&2
+      exit 1
+      ;;
+    *)
+      echo 'HTTP 422: Validation Failed (label does not exist)' >&2
+      exit 1
+      ;;
+  esac
+fi
+
+if [ "${args[0]:-}" = 'api' ] && is_contents_read; then
+  path=''
+  for a in "${args[@]}"; do
+    case $a in
+      */contents/*)
+        rest=${a#*/contents/}
+        path=${rest%%\?*}
+        ;;
+    esac
+  done
+  # A path that escapes the served root must not be servable; the checks reject those before asking.
+  if [ -z "${GH_STUB_REPO_ROOT:-}" ] || [ -z "$path" ]; then
+    echo "gh: no stubbed repository root" >&2
+    exit 1
+  fi
+  if [ -f "$GH_STUB_REPO_ROOT/$path" ]; then
+    cat "$GH_STUB_REPO_ROOT/$path"
+    exit 0
+  fi
+  echo "gh: Not Found (HTTP 404) for $path" >&2
+  exit 1
+fi
+
+if [ "${args[0]:-}" = 'api' ] && is_issue_read; then
+  case ${GH_STUB_ISSUE_API:-ok} in
+    403)
+      echo 'HTTP 403: Resource not accessible by integration' >&2
+      exit 1
+      ;;
+    missing)
+      echo 'gh: Not Found (HTTP 404)' >&2
+      exit 1
+      ;;
+    *)
+      if [ -z "${GH_STUB_ISSUE_LABELS:-}" ]; then
+        exit 0
+      fi
+      printf '%s\n' "$GH_STUB_ISSUE_LABELS" | tr ',' '\n'
+      exit 0
+      ;;
+  esac
+fi
+
+echo "gh-stub: unsupported invocation: ${args[*]}" >&2
+exit 1
