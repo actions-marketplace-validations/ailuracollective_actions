@@ -835,6 +835,61 @@ else
 fi
 
 # ===============================================================================================
+group 'marketplace metadata'
+# ===============================================================================================
+# The rules GitHub enforces before it will list an action. They are not optional polish: a missing
+# `branding` key means the action cannot be published at all, and the rest are hard rejections.
+# A list of categories and an icon exclusion list are copied into the manifests as comments, so this
+# assertion is the part that keeps the two from drifting.
+mkt=$(PRV_ROOT="$ROOT" python3 -c "
+import os, yaml
+root = os.environ['PRV_ROOT']
+rels = [r for r in os.environ['PRV_MANIFESTS'].splitlines() if r]
+COLORS = {'white','black','yellow','blue','green','orange','red','purple','gray-dark'}
+CATEGORIES = {
+    'testing','code quality','formatting','linting tools','monitoring','code analysis','chat',
+    'dependencies','containers','database','files and directories','images and artwork','input',
+    'integration','licensing','mail and messaging','mobile','other','project management','publishing',
+    'security','seo','text processing','utility','version control','workflow automation',
+}
+BANNED_ICONS = {
+    'coffee','columns','divide-circle','divide-square','divide','frown','hexagon','key','meh',
+    'mouse-pointer','smile','tool','x-octagon',
+}
+owner = 'ailuracollective'
+problems, names, seen = [], [], set()
+for rel in rels:
+    d = yaml.safe_load(open(os.path.join(root, rel)))
+    name, desc = d.get('name', ''), d.get('description', '')
+    label = '%s: %s' % (rel, name)
+    names.append((label, name))
+    if not name or not name[0].isupper():
+        problems.append(label + ' name must begin with a capital letter')
+    if name.lower() in CATEGORIES:
+        problems.append(label + ' name collides with a Marketplace category')
+    if name.lower() == owner:
+        problems.append(label + ' name must not match the publishing owner')
+    if name in seen:
+        problems.append(label + ' duplicates another action name in this repository')
+    seen.add(name)
+    if not desc or not desc[0].isupper():
+        problems.append(label + ' description must begin with a capital letter')
+    b = d.get('branding')
+    if not b:
+        problems.append(label + ' has no branding; it cannot be listed in the Marketplace')
+        continue
+    if b.get('color') not in COLORS:
+        problems.append(label + ' branding.color must be one of %s, got %r' % (sorted(COLORS), b.get('color')))
+    icon = b.get('icon')
+    if not icon:
+        problems.append(label + ' branding.icon is missing')
+    elif icon in BANNED_ICONS:
+        problems.append(label + ' branding.icon %r is on the excluded list' % icon)
+print('|'.join(problems))
+")
+  assert_eq 'every action satisfies the Marketplace metadata rules' '' "$mkt"
+
+# ===============================================================================================
 group 'syntax of every script'
 # ===============================================================================================
 # Entry points and test scripts are executed, so they must parse on their own. lib/ modules are

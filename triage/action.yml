@@ -43,3 +43,11 @@ runs:
         PRV_CHECKS: 'auto-label'
         PRV_LABELS: 'Auto-label issue'
       run: bash ${{ github.action_path }}/../lib/report.sh
+
+# Marketplace listing metadata. `color` accepts only nine named values — white, black,
+# yellow, blue, green, orange, red, purple, gray-dark — not a hex code. `icon` must be a
+# Feather v4.28.0 name, excluding coffee, columns, divide, divide-circle, divide-square,
+# frown, hexagon, key, meh, mouse-pointer, smile, tool and x-octagon.
+branding:
+  icon: 'tag'
+  color: 'orange'

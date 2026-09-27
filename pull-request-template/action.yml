@@ -73,3 +73,11 @@ runs:
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         EVENT_SHA: ${{ github.sha }}
       run: bash ${{ github.action_path }}/resolve.sh
+
+# Marketplace listing metadata. `color` accepts only nine named values — white, black,
+# yellow, blue, green, orange, red, purple, gray-dark — not a hex code. `icon` must be a
+# Feather v4.28.0 name, excluding coffee, columns, divide, divide-circle, divide-square,
+# frown, hexagon, key, meh, mouse-pointer, smile, tool and x-octagon.
+branding:
+  icon: 'file-text'
+  color: 'purple'

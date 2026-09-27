@@ -50,3 +50,11 @@ runs:
         PRV_LABELS: 'Branch name'
         PRV_NOTE: 'This check runs on `opened` only. GitHub cannot rename a branch an open pull request points at, so `head.ref` is fixed for the life of the pull request; re-validating it on every event would spend runner minutes re-deriving a fact that cannot have changed.'
       run: bash ${{ github.action_path }}/lib/report.sh
+
+# Marketplace listing metadata. `color` accepts only nine named values — white, black,
+# yellow, blue, green, orange, red, purple, gray-dark — not a hex code. `icon` must be a
+# Feather v4.28.0 name, excluding coffee, columns, divide, divide-circle, divide-square,
+# frown, hexagon, key, meh, mouse-pointer, smile, tool and x-octagon.
+branding:
+  icon: 'git-branch'
+  color: 'blue'
