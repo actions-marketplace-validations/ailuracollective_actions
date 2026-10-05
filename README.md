@@ -17,10 +17,12 @@ listed under, and adopting it by mistake fails on purpose: a consumer who writes
 `ailuracollective/actions@v1` gets a failed run naming all four paths above.
 
 They are separate because they answer different questions and need different permissions. Branch
-naming needs no token at all. The PR policy needs `pull-requests: read` and `contents: read`. Issue
-triage needs `issues: write` — the only one, and the only one that cannot work on a pull request from
-a fork, because a fork event carries no secrets. A consumer that only wants branch naming should not
-have to grant the others.
+naming needs no token at all, which is why its [status comment](#the-status-comment) is off by
+default there. The PR policy needs `contents: read` and `pull-requests: read` — both are reads, and
+publishing its status comment is done with a token of its own rather than by widening these. Issue
+triage needs `issues: write` — the only one that writes, and the only one that cannot work on a
+pull request from a fork, because a fork event carries no secrets. A consumer that only wants branch
+naming should not have to grant the others.
 
 ### One Marketplace listing
 
@@ -81,7 +83,24 @@ jobs:
           branch-types: feat,fix,chore
 ```
 
-`permissions: {}` is correct and worth keeping: this check reads nothing from the API.
+`permissions: {}` is correct and worth keeping: this check reads nothing from the API, and its
+[status comment](#the-status-comment) is **off by default here** for the same reason. Opt in with
+the token the comment needs, and read [Who writes the comment](#who-writes-the-comment) for why that
+token is not the one the checks read with:
+
+```yaml
+    permissions: {}
+    steps:
+      - uses: ailuracollective/actions/branch-validation@v1
+        with:
+          branch-types: feat,fix,chore
+          enable-status-comment: true
+          comment-token: ${{ secrets.AILURA_KITTY_TOKEN }}
+```
+
+A `pull-requests: write` grant also works and is the whole answer for a repository with no
+organisation account to post as — but then the comment belongs to `github-actions[bot]`, and this
+action will refuse to post it unless you say so with `comment-author: github-actions[bot]`.
 
 It runs on `opened` only. GitHub cannot rename a branch an open pull request points at, so
 `head.ref` is fixed for the life of the pull request, and re-validating it on every event would spend
@@ -97,7 +116,8 @@ on:
 jobs:
   pr-policy:
     runs-on: ubuntu-latest
-    # One token serves all five checks, so least privilege is a single block.
+    # What the five checks need. Nothing here can change the pull request: they read labels, the
+    # base branch and the issue a `Closes` points at, and stop there.
     permissions:
       pull-requests: read
       contents: read
@@ -107,6 +127,10 @@ jobs:
           title-max: 80
           type-labels: feat,fix,chore,breaking-change
           enable-title-length: false
+          # Publishing the comment is a write, so it gets a token of its own. Optional: a job that
+          # grants `pull-requests: write` and says nothing here works too, at the cost of an author
+          # nobody in the organisation owns.
+          comment-token: ${{ secrets.AILURA_KITTY_TOKEN }}
 ```
 
 ### Checks
@@ -136,6 +160,99 @@ names no allowed type. It reports `skipped` and names `pr-title-conventional` as
 than a green tick for a validation that never happened. The closing line of the summary reads
 `All N checks passed (M skipped, not run for this pull request)`: a skip is counted as a
 non-failure, so a required status is still satisfied, but it is never folded into the passed count.
+
+### The status comment
+
+The job summary is only where somebody is looking while they are looking at the run. The same table
+is therefore published into the pull request conversation, where the author is already looking, and
+it is **one comment per action, updated in place**: the second run edits the first run's comment
+instead of adding another, and what stays on the pull request is always the current status. It is on
+by default for the PR policy, off by default for branch validation — that action exists so a consumer
+can validate branch names granting nothing at all — and either way is one input away:
+
+```yaml
+    steps:
+      - uses: ailuracollective/actions/pull-request@v1
+        with:
+          comment-token: ${{ secrets.AILURA_KITTY_TOKEN }}
+          enable-status-comment: false
+```
+
+The body is the same rendering as the job summary — every check, its verdict and its detail, the
+counts, and a link to the workflow run — posted by [Ailura Kitty](#who-writes-the-comment), and
+preceded by an invisible HTML marker naming the action:
+
+```
+<!-- ailuracollective-actions:status action=pull-request run=1700000000 -->
+```
+
+That marker is what makes the three properties below hold.
+
+- **One action never overwrites another's comment.** The key is the action's own directory name, and
+  two actions run in separate jobs on the same pull request. A pull request that adopts both the PR
+  policy and branch validation carries one comment per action, each with only its own checks.
+- **A comment anyone else wrote is never rewritten.** Only a body that *starts* with the marker
+  carrying a run id can have been written by this mechanism, so quoting the marker, or an earlier
+  comment, in a reply is inert: the quoted text is left exactly as it was.
+- **A slower run cannot overwrite a newer result.** Run ids only increase, so a run whose id is lower
+  than the one recorded in the comment it found publishes nothing and says so in the log. Without
+  that guard, the second of two concurrent runs to finish would leave its outdated table as the
+  current status.
+
+Publishing is an addition to the reporting, never a replacement for it: the job summary is written
+first and is what this action guarantees, and every comment failure — a refused token, an API error, a
+missing variable — is a warning that leaves the verdict untouched. A gate that cannot comment must
+still fail the pull requests it found defects in, and a gate that passes must not be failed by a
+comment. A refused token names `pull-requests: write` as the fix, and notes the case no permission
+block can widen: a `pull_request` trigger from a fork gets a read-only token, so fork pull requests
+get the job summary and no comment. The same limitation the Linear key already has.
+
+### Who writes the comment
+
+**Ailura Kitty**, and the action refuses to post under any other identity.
+
+A GitHub comment is authored by the account that owns the token that wrote it — the payload cannot
+carry an author. The workflow's own token would therefore post as `github-actions[bot]`: nobody can
+edit or delete what it wrote, and the comment outlives the person who could fix it. So the publishing
+token belongs to the organisation:
+
+```yaml
+jobs:
+  pr-policy:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      contents: read
+    steps:
+      - uses: ailuracollective/actions/pull-request@v1
+        with:
+          comment-token: ${{ secrets.AILURA_KITTY_TOKEN }}
+          comment-author: AiluraKitty
+```
+
+`comment-author` defaults to `AiluraKitty` and is checked against `gh api user` before anything is
+written. Two properties follow from making that a rule rather than a convention:
+
+- **Nothing is posted under an identity nobody chose.** A token belonging to another account — a
+  bot, a maintainer's personal token, a GitHub App installation — publishes nothing and warns,
+  naming both logins and the three ways to resolve it.
+- **A token whose identity cannot be read publishes nothing either.** An unreadable identity is not
+  an identity that matched.
+
+The writing token is `comment-token`, not `github-token`, and that split is the load-bearing part.
+Publishing a comment is the only write this action makes, so it is the only call that needs a token
+with the power to write; `github-token` still goes to the five checks, which only read, and stays
+grantable as the read-only scope it is. An organisation's personal access token can post as a person
+and can be spent anywhere — a stranger's pull request should not get to hold one while five scripts
+judge it. Consumers who have no opinion about authorship pass neither input and get the behaviour
+they had: `comment-token` falls back to `github-token`.
+
+The token belongs in a secret. A `with:` value is echoed into the step's rendered command; an `env`
+value is not, which is why the report reads `GH_TOKEN` from the environment and why the workflow
+above passes the secret by name rather than by value.
+
+Fork pull requests cannot comment at all, for the reason above: no secrets, so no token that could
+be Kitty's. They get the job summary, which is the reporting this hub guarantees.
 
 ### Two vocabularies, two inputs
 
@@ -304,6 +421,7 @@ branch-validation/action.yml        branch validation, one check
 branch-validation/branch-name.sh    its entry point, beside its own manifest
 lib/common.sh                  shared module: result recording, event gating, escaping, parsers
 lib/template.sh                shared module: the template resolution rule
+lib/comment.sh                 shared module: the sticky pull request comment, one per action
 lib/report.sh                  shared module: the job-summary table and the aggregated exit
 pull-request/action.yml        PR policy, five checks
 pull-request/<check>.sh        its entry points
@@ -394,7 +512,9 @@ One `../` hop, because an action's directory is a sibling of `lib/`. Invoke it a
 `bash ${{ github.action_path }}/my-check.sh`, not as a bare path, so a consumer who lost the
 executable bit on a clone or a zip download does not get a failure they cannot diagnose.
 
-**3. A report step**, unless the action is a single step with nothing to aggregate:
+**3. A report step**, unless the action is a single step with nothing to aggregate. On a
+`pull_request` trigger, the step also owns this action's sticky comment, which is what `PRV_ACTION`
+selects and what the `PR_NUMBER`/`GH_TOKEN`/`GH_REPO` trio points it at:
 
 ```yaml
     - name: Report
@@ -402,12 +522,41 @@ executable bit on a clone or a zip download does not get a failure they cannot d
       shell: bash
       env:
         RESULTS_DIR: ${{ runner.temp }}/prv-results
-        GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        PRV_ACTION: 'my-action'
+        PRV_PUBLISH_COMMENT: ${{ inputs.enable-status-comment }}
+        PRV_COMMENT_AUTHOR: ${{ inputs.comment-author }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        GH_TOKEN: ${{ inputs.comment-token || inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
         PRV_TITLE: 'My action'
         PRV_CHECKS: 'my-check|my-other-check'
         PRV_LABELS: 'My check|My other check'
       run: bash ${{ github.action_path }}/../lib/report.sh
 ```
+
+`PRV_ACTION` is the action's own directory name, and it is the only thing telling this action's
+comment from another's: two actions run in separate jobs on the same pull request, and each updates
+only the comment carrying its own key. Omit it and nothing is published — the report says so as a
+warning naming the variable, rather than posting a comment no later run could find. `PR_NUMBER` is not
+a runner default, so it has to be passed; `GITHUB_RUN_ID` and `GITHUB_REPOSITORY` are, and are read
+from the runner instead of from the manifest because they cannot be misconfigured.
+
+**Pass `GITHUB_STEP_SUMMARY` never.** GitHub sets it in every step's environment, and a step-level
+`env:` entry replaces that value rather than merging with it. The spelling
+`GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}` looks like a pass-through and is not one: the
+`env` context holds the workflow's own variables, not the runner's defaults, so it resolves to an
+empty string and the step summary is never written. Every report step in this repository carried
+that line from the initial commit, so the table reached the log and no job summary anywhere, with
+nothing reporting the loss. `lib/report.sh` now warns when there is no summary path, and the manifest
+group asserts that no step declares a runner default by reading it back out of the `env` context.
+
+`PRV_COMMENT_AUTHOR` is the login the comment has to belong to, and the report checks the token
+against it before writing anything: a comment is authored by whoever holds the writing token, so an
+unheld identity means an anonymous `github-actions[bot]` comment nobody can later correct. See [Who
+writes the comment](#who-writes-the-comment). Give the manifest a `comment-token` input and fall
+back to `github-token` the way the line above does: the comment is the only write in the action, and
+it is the only one that should ever see a token with the power to write.
 
 **4. `<name>/README.md`.** Usage, outputs, and what the action does *not* do.
 
@@ -423,6 +572,12 @@ manifest, syntax and discovery checks come for free.
 - User-controlled text in a workflow command is percent-escaped, and `%` is escaped first.
 - **No check script exits non-zero to signal failure.** Each records a verdict and exits 0; only
   `lib/report.sh` fails the job, which is what makes aggregation possible.
+- **Reporting is additive.** The job summary is written first and is the reporting this hub
+  guarantees; the status comment is published on top of it with its failures swallowed, so nothing
+  about the pull request is decided by whether a comment could be written.
+- **A comment is published only under a chosen identity.** The token's account is read and compared
+  against the configured author, because a comment's author is the token's owner and an unheld one
+  belongs to nobody who can edit it.
 - A check that records nothing is reported as `error`, never as a pass.
 - Every script uses `set -euo pipefail`.
 - Comments are one line, and only where a competent editor would otherwise get it wrong: security
@@ -447,6 +602,8 @@ duplicates.
 - **One action needs permissions another must not have.** They cannot share a caller's single token
   block, and least-privilege guidance stops being expressible. Triage and the PR policy are separated
   for exactly this reason, and they are still in one repository because that cost is only paid when a
-  consumer adopts both.
+  consumer adopts both. Branch validation is the clearest case: its check reads nothing, so it grants
+  nothing — and the status comment that would need `pull-requests: write` is off by default there for
+  that reason.
 
 Neither is true today.
