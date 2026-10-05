@@ -66,11 +66,19 @@ setup() {
   export INPUT_AUTO_LABEL_NAME='status:needs-review'
   export INPUT_SKIP_ACTORS=''
   export INPUT_ENABLE_AUTO_LABEL=true
+  export INPUT_COMMENT_AUTHOR='AiluraKitty'
   export PR_TITLE='' PR_BODY='' PR_LABELS='[]' HEAD_REF='' AUTHOR_LOGIN='' BASE_SHA=base1234
   export PR_BASE_SHA=base1234 EVENT_SHA=eventsha
   export ISSUE_NUMBER=''
   unset GH_STUB_ISSUE_EDIT GH_STUB_ISSUE_API GH_STUB_ISSUE_LABELS GH_STUB_REPO_ROOT
   unset LINEAR_API_KEY LINEAR_STUB_RESPONSE LINEAR_STUB_HTTP LINEAR_STUB_CAPTURE
+  # The status comment's variables are unset, not blanked, because the shared report must publish
+  # nothing at all when a run does not declare them: a blank PRV_ACTION is a manifest defect and is
+  # reported as one, and a test that wanted silence would be testing the wrong thing.
+  unset PRV_ACTION PRV_PUBLISH_COMMENT PRV_COMMENT_AUTHOR PR_NUMBER
+  unset GITHUB_RUN_ID GITHUB_REPOSITORY GITHUB_SERVER_URL
+  unset GH_STUB_COMMENTS_DIR GH_STUB_COMMENT_API GH_STUB_COMMENT_CAPTURE GH_STUB_COMMENT_PER_PAGE
+  unset GH_STUB_LOGIN GH_STUB_LOGIN_API
 }
 
 # A canned Linear GraphQL response for the given label names.
@@ -138,6 +146,95 @@ Explain the change.
 ## Testing
 
 Explain how it was tested.'
+
+# ----------------------------------------------------------------------------------------------
+# The sticky status comment, which the shared report publishes on top of the job summary.
+#
+# The store is a directory of files the `gh` stub serves, one file per comment, so a test can seed a
+# comment with `printf`, count them without a JSON parser, and diff a body to prove it was rewritten
+# rather than added. The calls log is what proves create-versus-update: a second comment and an
+# update look identical on a pull request that already had one.
+# ----------------------------------------------------------------------------------------------
+comment_store() { printf '%s/comments' "$RUNNER_TEMP"; }
+
+stub_comment() { # <id> <body>
+  mkdir -p "$(comment_store)"
+  printf '%s' "$2" > "$(comment_store)/$1.body"
+}
+
+# A comment exactly as an earlier run of an action would have left it.
+stub_status_comment() { # <id> <action> <run_id> <body>
+  stub_comment "$1" "$(printf '<!-- ailuracollective-actions:status action=%s run=%s -->\n\n%s' "$2" "$3" "$4")"
+}
+
+comment_body() { cat "$(comment_store)/$1.body" 2>/dev/null || true; }
+
+# The ids in the store, newest first: GitHub hands out increasing ids, so that is the order the
+# comments were created in, and the newest status comment for a key is the one a later run updates.
+comment_ids() {
+  local f
+  for f in "$(comment_store)"/*.body; do
+    [ -e "$f" ] || continue
+    printf '%s\n' "${f##*/}"
+  done | sed 's/\.body$//' | sort -rn
+}
+
+comment_count() { comment_ids | grep -c . || true; }
+comment_calls() { cat "$GH_STUB_COMMENT_CAPTURE" 2>/dev/null || true; }
+
+# The calls log spans every run since setup_comment, so a test that seeds the pull request with an
+# earlier run has to forget those calls before asserting what the run under test did.
+forget_comment_calls() { : > "$GH_STUB_COMMENT_CAPTURE"; }
+
+# The pull request's own comment, in the body the report rendered: the newest status comment for
+# `pull-request`, which is what a reader of the pull request is looking at, and which is the one the
+# next run would go on to update.
+our_comment() {
+  local id
+  for id in $(comment_ids); do
+    case $(comment_body "$id") in
+      *"action=$1 run="*) printf '%s' "$id"; return 0 ;;
+    esac
+  done
+}
+
+# One pull_request run of the shared report, with everything its manifest passes plus the runner
+# defaults a status comment reads. Overrides come last, so a test can replace any default here — the
+# event, the run id, or `PRV_ACTION=` to publish nothing at all.
+pr_comment_run() { # [VAR=value...]
+  env RESULTS_DIR="$RESULTS_DIR" GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+    GITHUB_EVENT_NAME=pull_request GITHUB_RUN_ID=1700000000 \
+    GITHUB_REPOSITORY=owner/repo GITHUB_SERVER_URL=https://github.com \
+    PRV_ACTION=pull-request PRV_COMMENT_AUTHOR=AiluraKitty PR_NUMBER=12 \
+    PRV_CHECKS="$PRV_CHECK_LIST" PRV_LABELS="$PRV_LABEL_LIST" PRV_TITLE='Pull request policy' \
+    "$@" bash "$ROOT/lib/report.sh" 2>&1
+}
+
+# Every assertion about a comment needs the store, and a run that finds no comment creates one, so
+# the two are set up together rather than in each test.
+setup_comment() { # [VAR=value...]
+  GH_STUB_COMMENTS_DIR=$(comment_store)
+  export GH_STUB_COMMENTS_DIR
+  export GH_STUB_COMMENT_CAPTURE="$RUNNER_TEMP/comment-calls"
+  export HEAD_REF='janedoe/feat/parser-fallback' AUTHOR_LOGIN='janedoe'
+  run_check branch-name >/dev/null
+  : > "$GH_STUB_COMMENT_CAPTURE"
+}
+
+# The PR policy's five verdicts for a pull request that satisfies all of them, so a comment test can
+# assert on a table with content rather than on an empty one.
+setup_compliant_pr() {
+  setup
+  export HEAD_REF='janedoe/feat/parser-fallback' AUTHOR_LOGIN='janedoe'
+  export PR_TITLE='feat: add the parser fallback'
+  export PR_BODY=$'## Summary\n\nAdded the parser fallback.\n\n## Testing\n\nRan the suite.\n\nCloses #12'
+  export PR_LABELS='[{"name":"feat"}]'
+  stub_repo feat 'feat.md' "$DEFAULT_TEMPLATE_BODY"
+  export GH_STUB_ISSUE_LABELS='status:approved'
+  for check in linked-issue type-label pr-title-length pr-title-conventional pr-body-structure; do
+    run_check "$check" >/dev/null
+  done
+}
 
 # ===============================================================================================
 group 'branch-name'
@@ -723,12 +820,284 @@ code=$?
 assert_eq 'a report with no check list exits non-zero' 1 "$code"
 assert_contains 'and blames the action, not the pull request' 'Nothing about the pull request is at fault' "$out"
 
+# An unwritable job summary is a silent failure of the one thing this action guarantees, so it says
+# so and names the cause. This ran as a `[ -n … ] &&` guard for the life of the repository and wrote
+# no summary on any real run, because the manifests blanked the variable.
+setup; export HEAD_REF='janedoe/feat/parser-fallback' AUTHOR_LOGIN='JaneDoe'; run_check branch-name >/dev/null
+out=$(env RESULTS_DIR="$RESULTS_DIR" GITHUB_STEP_SUMMARY='' \
+  PRV_CHECKS="$BRV_CHECK_LIST" PRV_LABELS="$BRV_LABEL_LIST" PRV_TITLE='Branch validation' \
+  bash "$ROOT/lib/report.sh" 2>&1)
+code=$?
+assert_eq 'a report with no summary path still renders' 0 "$code"
+assert_contains 'it warns rather than dropping the summary quietly' 'No job summary was written' "$out"
+assert_contains 'and names the mistake that causes it' 'GITHUB_STEP_SUMMARY' "$out"
+assert_contains 'pointing at the manifest line to delete' 'remove any' "$out"
+assert_contains 'while the table still reaches the step log' '| ✅ | Branch name |' "$out"
+
+# A path that exists but cannot be appended to is the other half: the write fails, so the report
+# must not have called itself done.
+setup; export HEAD_REF='janedoe/feat/parser-fallback' AUTHOR_LOGIN='JaneDoe'; run_check branch-name >/dev/null
+out=$(env RESULTS_DIR="$RESULTS_DIR" GITHUB_STEP_SUMMARY="$RUNNER_TEMP/no-such-dir/summary.md" \
+  PRV_CHECKS="$BRV_CHECK_LIST" PRV_LABELS="$BRV_LABEL_LIST" PRV_TITLE='Branch validation' \
+  bash "$ROOT/lib/report.sh" 2>&1)
+code=$?
+assert_eq 'a report with an unwritable summary path still renders' 0 "$code"
+assert_contains 'it warns that the summary could not be written' 'could not be written' "$out"
+
 # Parallel lists that do not line up would silently mislabel every row.
 setup; run_check branch-name >/dev/null
 out=$(report_for 'branch-name|type-label' 'Branch name')
 code=$?
 assert_eq 'mismatched check and label lists exit non-zero' 1 "$code"
 assert_contains 'and say so explicitly' 'parallel' "$out"
+
+# ===============================================================================================
+group 'report: the sticky status comment'
+# ===============================================================================================
+# The job summary is only where somebody is looking while they are looking at the run. The same
+# report is therefore published into the pull request conversation, once per action and edited in
+# place on every later run. The cases below are the properties that make it a status board instead of
+# one comment per push: it finds its own comment again, it never touches anyone else's, and a failure
+# to comment never becomes a failure of the pull request.
+
+# The first run of an action on a pull request finds no comment of its own, so it creates one.
+setup_compliant_pr; setup_comment
+out=$(pr_comment_run)
+code=$?
+assert_eq 'a first run posts a comment and passes the pull request' 0 "$code"
+assert_eq 'and the pull request gains exactly one comment' 1 "$(comment_count)"
+body=$(comment_body "$(our_comment pull-request)")
+assert_eq 'whose first line is the marker that identifies this action' \
+  '<!-- ailuracollective-actions:status action=pull-request run=1700000000 -->' "$(printf '%s' "$body" | head -n1)"
+assert_contains 'and which carries every verdict' '| ✅ | Linked issue |' "$body"
+assert_contains 'with the summary line a reader acts on' 'All 5 checks passed' "$body"
+assert_contains 'and a link to the run it came from' \
+  '[Workflow run](https://github.com/owner/repo/actions/runs/1700000000)' "$body"
+assert_contains 'the run says what it published' 'Status comment posted on pull request #12.' "$out"
+
+# The second run has to edit the first run's comment. A pull request that gains one comment per push is
+# unreadable within a week, and the calls log is the only thing that tells the two apart.
+setup_compliant_pr; setup_comment
+pr_comment_run >/dev/null
+forget_comment_calls
+out=$(pr_comment_run GITHUB_RUN_ID=1700000001)
+code=$?
+assert_eq 'a second run still passes the pull request' 0 "$code"
+assert_eq 'and adds no second comment' 1 "$(comment_count)"
+assert_contains 'it updates the existing comment' 'PATCH' "$(comment_calls)"
+assert_not_contains 'rather than posting another' 'POST' "$(comment_calls)"
+assert_contains 'and the comment now names the run that wrote it' 'run=1700000001 -->' \
+  "$(comment_body "$(our_comment pull-request)")"
+assert_contains 'the run says what it published' 'Status comment updated on pull request #12.' "$out"
+
+# A pull request with more comments than fit in one page of the API response still has to find its own
+# comment: reading only the first page would post a copy on every run, which is the one thing the
+# marker exists to prevent.
+setup_compliant_pr; setup_comment
+stub_comment 1 'Looks good to me.'
+stub_comment 2 'Rebased onto main.'
+stub_comment 3 'Unrelated review.'
+pr_comment_run >/dev/null
+assert_eq 'a pull request with several comments still gets one' 4 "$(comment_count)"
+forget_comment_calls
+out=$(pr_comment_run GITHUB_RUN_ID=1700000001 GH_STUB_COMMENT_PER_PAGE=1)
+assert_eq 'and a later run adds none' 4 "$(comment_count)"
+assert_contains 'because the lookup reads past the first page' 'PATCH' "$(comment_calls)"
+assert_not_contains 'instead of posting a duplicate' 'POST' "$(comment_calls)"
+
+# The marker names the action, so each action has its own comment and no run can overwrite another's.
+# Two actions run in separate jobs on the same pull request, which is the case this protects.
+setup_compliant_pr; setup_comment
+stub_status_comment 1 'pull-request' 1699999999 'All 5 checks passed'
+stub_status_comment 2 'branch-validation' 1699999999 'Branch name passed.'
+before=$(comment_body 1)
+forget_comment_calls
+out=$(pr_comment_run PRV_ACTION=branch-validation PRV_CHECKS=branch-name PRV_LABELS='Branch name' GITHUB_RUN_ID=1700000001)
+assert_eq 'one comment per action, never a second for either' 2 "$(comment_count)"
+assert_contains 'marked with its own key and the newer run' '<!-- ailuracollective-actions:status action=branch-validation run=1700000001 -->' \
+  "$(comment_body "$(our_comment branch-validation)")"
+assert_eq "and the other action's comment is left exactly as it was" "$before" "$(comment_body 1)"
+assert_not_contains 'it writes only to the comment its own marker names' 'issues/comments/1' "$(comment_calls)"
+assert_contains 'the one it did claim' 'issues/comments/2' "$(comment_calls)"
+
+# A contributor quoting the marker — say, an earlier run's comment pasted into a reply — must not have
+# it overwritten with our table. Only a comment this module wrote *starts* with the marker, so that is
+# what is matched, and everything else on the pull request is left exactly as it was.
+setup_compliant_pr; setup_comment
+stub_comment 1 'Looks good to me.'
+stub_comment 2 'Why did the parser fallback need a second regex? I saw
+
+<!-- ailuracollective-actions:status action=pull-request run=1700000000 -->
+
+quoted here and it looked odd.'
+out=$(pr_comment_run)
+code=$?
+assert_eq 'a quoted marker does not fail the run' 0 "$code"
+assert_eq 'and gets a status comment of its own rather than a rewrite' 3 "$(comment_count)"
+assert_eq 'the run leaves the review it found alone' 'Looks good to me.' "$(comment_body 1)"
+assert_contains 'and the question that quoted the marker' 'second regex' "$(comment_body 2)"
+assert_contains 'while the real status comment is the newest one' '| ✅ | Linked issue |' \
+  "$(comment_body "$(our_comment pull-request)")"
+
+# A comment that claims the marker but carries no run id is not one we wrote — or is one that was
+# deleted mid-run. Either way the pull request must not be left without a status, so it is replaced.
+setup_compliant_pr; setup_comment
+stub_comment 1 '<!-- ailuracollective-actions:status action=pull-request run=unknown -->
+
+All 5 checks passed'
+pr_comment_run >/dev/null
+assert_eq 'an unreadable run id yields a fresh status comment' 2 "$(comment_count)"
+assert_contains 'that names the run that wrote it' 'run=1700000000 -->' \
+  "$(comment_body "$(our_comment pull-request)")"
+
+# An issue has no pull request conversation to comment in, so the same report publishes nothing there.
+setup_compliant_pr; setup_comment
+out=$(pr_comment_run GITHUB_EVENT_NAME=issues)
+code=$?
+assert_eq 'the issues stream still reports normally' 0 "$code"
+assert_eq 'and makes no comment API call at all' '' "$(comment_calls)"
+
+# A refused token is the common case: the checks read with a token somebody was happy to grant read
+# access to, and nothing told the consumer that commenting needs write. It is a warning, not a gate.
+setup_compliant_pr; setup_comment
+out=$(pr_comment_run GH_STUB_COMMENT_API=403)
+code=$?
+assert_eq 'a refused token does not fail a compliant pull request' 0 "$code"
+assert_contains 'it warns' 'warning::' "$out"
+assert_contains 'naming the permission to add' 'pull-requests: write' "$out"
+assert_contains 'and offering the opt-out' 'enable-status-comment: false' "$out"
+assert_contains 'and explaining the fork case no permission can widen' 'fork' "$out"
+assert_contains 'the job summary is still the reporting this action guarantees' '| ✅ | Linked issue |' \
+  "$(cat "$GITHUB_STEP_SUMMARY")"
+
+# Any other failure is quoted rather than guessed at, and still changes nothing about the verdict.
+setup_compliant_pr; setup_comment
+export HEAD_REF='wrong-shape' AUTHOR_LOGIN='janedoe'
+run_check branch-name >/dev/null
+rm -f "$RESULTS_DIR/branch-name.status"
+out=$(pr_comment_run GH_STUB_COMMENT_API=fail GITHUB_RUN_ID=1700000001 PRV_CHECKS='branch-name' PRV_LABELS='Branch name')
+code=$?
+assert_eq 'an API failure does not pass a pull request that failed its checks' 1 "$code"
+assert_contains 'it quotes what the API said' 'HTTP 500' "$out"
+assert_eq 'and no comment was left behind' 0 "$(comment_count)"
+
+# Run ids only increase, so a run that finishes late must leave a newer result in place. Publishing
+# the outdated one would make the status board lie about the current state of the pull request.
+setup_compliant_pr; setup_comment
+stub_status_comment 1 'pull-request' 1700000005 'All 5 checks passed'
+before=$(comment_body 1)
+out=$(pr_comment_run GITHUB_RUN_ID=1700000001)
+code=$?
+assert_eq 'a run older than the comment it found passes' 0 "$code"
+assert_contains 'and says why it stood aside' 'newer run' "$out"
+assert_eq 'the newer comment is untouched' "$before" "$(comment_body 1)"
+assert_not_contains 'and nothing was written' 'PATCH' "$(comment_calls)"
+
+# A comment is authored by the owner of the token that writes it, so the identity has to be held to
+# something: the workflow's own token would write as `github-actions[bot]`, which belongs to nobody
+# who can edit or delete what it posted. The account is read with `gh api user`, which is the only
+# place GitHub answers that question.
+setup_compliant_pr; setup_comment
+export GH_STUB_LOGIN='github-actions[bot]'
+out=$(pr_comment_run)
+code=$?
+assert_eq 'a token that is not AiluraKitty does not fail the pull request' 0 "$code"
+assert_contains 'it warns' 'warning::' "$out"
+assert_contains 'naming the identity the token actually has' 'github-actions[bot]' "$out"
+assert_contains 'and the one it has to be' 'AiluraKitty' "$out"
+assert_contains 'with the input that would accept it' 'comment-author: github-actions[bot]' "$out"
+assert_eq 'and publishes nothing at all' '' "$(comment_calls)"
+assert_eq 'so the pull request gains no comment' 0 "$(comment_count)"
+assert_contains 'while the job summary is still written' '| ✅ | Linked issue |' "$(cat "$GITHUB_STEP_SUMMARY")"
+
+# The organisation's own token does publish, and the login is matched case-insensitively because
+# GitHub logins are: `AiluraKitty` and `ailurakatty` are one account.
+setup_compliant_pr; setup_comment
+export GH_STUB_LOGIN='ailurakitty'
+out=$(pr_comment_run PRV_COMMENT_AUTHOR='AiluraKitty')
+assert_eq 'the right token publishes' 1 "$(comment_count)"
+assert_not_contains 'regardless of how the login is cased' 'No status comment published' "$out"
+
+# A consumer that wants a different account can name it, and gets exactly that account's comment.
+setup_compliant_pr; setup_comment
+export GH_STUB_LOGIN='another-bot'
+out=$(pr_comment_run PRV_COMMENT_AUTHOR='another-bot')
+assert_eq 'a configured account is honoured' 1 "$(comment_count)"
+assert_not_contains 'and nothing warns about it' 'No status comment published' "$out"
+
+# An identity that cannot be read is not an identity that matched: a token whose owner is unknown
+# must not be assumed to be the right one.
+setup_compliant_pr; setup_comment
+export GH_STUB_LOGIN_API=fail
+out=$(pr_comment_run)
+code=$?
+assert_eq 'an unreadable identity does not fail the pull request' 0 "$code"
+assert_contains 'it warns rather than posting under an unknown author' 'identity of the token could not be read' "$out"
+assert_eq 'and publishes nothing' 0 "$(comment_count)"
+
+# No expected identity at all is a report step that forgot an input, not a licence to post as anyone.
+setup_compliant_pr; setup_comment
+out=$(pr_comment_run PRV_COMMENT_AUTHOR=)
+code=$?
+assert_eq 'a missing author does not fail the pull request' 0 "$code"
+assert_contains 'it names the variable to set' 'PRV_COMMENT_AUTHOR' "$out"
+assert_eq 'and publishes nothing' 0 "$(comment_count)"
+
+# The opt-out is a manifest input rather than an inference from a refused token: a consumer who does
+# not want a comment should not also have to read a warning telling them to grant one.
+setup_compliant_pr; setup_comment
+out=$(pr_comment_run PRV_PUBLISH_COMMENT=false)
+code=$?
+assert_eq 'opting out still passes the pull request' 0 "$code"
+assert_eq 'and makes no API call at all' '' "$(comment_calls)"
+
+# A report step that forgot to declare an action key is a workflow defect, and is reported as one
+# rather than quietly publishing a comment nobody can later identify or update.
+setup_compliant_pr; setup_comment
+out=$(pr_comment_run PRV_ACTION=)
+code=$?
+assert_eq 'a missing action key does not fail the pull request' 0 "$code"
+assert_contains 'it warns' 'warning::' "$out"
+assert_contains 'naming the variable to set' 'PRV_ACTION' "$out"
+assert_eq 'and makes no API call at all' '' "$(comment_calls)"
+
+# The key is spliced into the marker, so a key that is not a plain word would make the comment
+# impossible to match later.
+setup_comment
+out=$(pr_comment_run PRV_ACTION='pull request')
+assert_contains 'an unmatchable action key is refused' 'is not a plain action key' "$out"
+assert_eq 'and still makes no API call' '' "$(comment_calls)"
+
+# Without a run id this run cannot be ordered against the comment it found, so a slower run could
+# overwrite a newer result — the reason the guard exists.
+setup_comment
+out=$(pr_comment_run GITHUB_RUN_ID=)
+assert_contains 'a missing run id is refused by name' 'GITHUB_RUN_ID' "$out"
+assert_eq 'and still makes no API call' '' "$(comment_calls)"
+
+# PR_NUMBER is not a runner default, so a manifest that forgets it has to be told how to pass it.
+setup_comment
+out=$(pr_comment_run PR_NUMBER=)
+assert_contains 'a missing pull request number is refused by name' 'PR_NUMBER' "$out"
+assert_eq 'and still makes no API call' '' "$(comment_calls)"
+
+# The link is built from runner defaults rather than from a manifest, so a run without them gets a
+# complete comment instead of a broken link or a refusal.
+setup_compliant_pr; setup_comment
+pr_comment_run GITHUB_SERVER_URL= GITHUB_REPOSITORY= >/dev/null
+body=$(comment_body "$(our_comment pull-request)")
+assert_not_contains 'no run link is invented' '[Workflow run](' "$body"
+assert_contains 'while the comment itself is complete' 'All 5 checks passed' "$body"
+
+# A failing pull request is the case a status board exists for: its comment has to say so.
+setup_compliant_pr; setup_comment
+rm -f "$RESULTS_DIR/type-label.status"
+out=$(pr_comment_run)
+code=$?
+assert_eq 'a pull request that fails a check still fails the job' 1 "$code"
+body=$(comment_body "$(our_comment pull-request)")
+assert_contains 'and its comment names the failed check' '| 🚨 | Type label |' "$body"
+assert_contains 'with the count a reader needs' '**1 of 5 checks failed.**' "$body"
 
 # ===============================================================================================
 group 'pull-request-template (the standalone action)'
@@ -900,6 +1269,95 @@ for rel in os.environ['PRV_MANIFESTS'].splitlines():
 print('|'.join(bad))
 ")
   assert_eq 'every check step in every action declares continue-on-error' '' "$coe"
+
+  # Publishing the sticky comment is the only write any of these actions makes, so it is the only one
+  # that should ever be handed a token with the power to write. A manifest that wired the report's
+  # `GH_TOKEN` straight to `github-token` would force a consumer to choose between an organisation
+  # account posting the comment and five check scripts holding that account's token, and the second
+  # is the one nobody would notice choosing.
+  #
+  # `comment-token` falls back to `github-token`, so the fallback keeps a token-less consumer
+  # working; what is forbidden is the report sharing the checks' token unconditionally.
+  tokens=$(PRV_ROOT="$ROOT" python3 -c "
+import os, yaml
+root = os.environ['PRV_ROOT']
+bad = []
+for rel in os.environ['PRV_MANIFESTS'].splitlines():
+    if not rel:
+        continue
+    d = yaml.safe_load(open(os.path.join(root, rel)))
+    name = os.path.dirname(rel)
+    for s in d['runs'].get('steps', []):
+        env = (s.get('env') or {}).get('GH_TOKEN')
+        # Only the report carries PRV_ACTION; a check step's GH_TOKEN is a read token and is fine.
+        if not (s.get('env') or {}).get('PRV_ACTION'):
+            continue
+        if env != '\${{ inputs.comment-token || inputs.github-token }}':
+            bad.append('%s: %s' % (name, env))
+print('|'.join(bad))
+")
+  assert_eq 'the report step publishes with comment-token, falling back to github-token' '' "$tokens"
+
+  # An input nothing reads is a promise the manifest does not keep, and `comment-token` is only
+  # worth declaring if it is optional — a required one would be a breaking change for every consumer
+  # already calling this action with the inputs it had.
+  unpublished=$(PRV_ROOT="$ROOT" python3 -c "
+import os, yaml
+root = os.environ['PRV_ROOT']
+bad = []
+for rel in os.environ['PRV_MANIFESTS'].splitlines():
+    if not rel:
+        continue
+    d = yaml.safe_load(open(os.path.join(root, rel)))
+    spec = (d.get('inputs') or {}).get('comment-token')
+    if not spec:
+        continue
+    if spec.get('required') or spec.get('default') != '':
+        bad.append('%s: required=%r default=%r' % (os.path.dirname(rel), spec.get('required'), spec.get('default')))
+print('|'.join(bad))
+")
+  assert_eq 'comment-token is declared optional with an empty default, so it costs no consumer anything' '' "$unpublished"
+
+  # A runner default belongs to the runner, and re-declaring one that a script reads from the
+  # environment breaks the script rather than documenting anything. `GITHUB_STEP_SUMMARY` is the
+  # case that cost this repository its job summary: all three report steps declared
+  # `GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}`, the `env` context holds only the
+  # workflow's own variables rather than the runner's defaults, so the expression resolved to an
+  # empty string and replaced the path GitHub had set. The table reached the log and no job summary
+  # anywhere, silently, for the life of the repository.
+  #
+  # Scoped to the defaults a step's own script reads from `env`. Re-declaring one to pass it through
+  # a context expression is the defect; a step that genuinely needs to set a different value, like
+  # `GITHUB_EVENT_NAME` on a workflow that triggers on more than one event, is legitimate.
+  # `${{ env.X }}` for a `GITHUB_*` name is the tell: it is the only spelling that cannot resolve.
+  runner_defaults=$(PRV_ROOT="$ROOT" python3 -c "
+import os, re, yaml
+root = os.environ['PRV_ROOT']
+# Documented defaults GitHub sets in every step's environment. GITHUB_STEP_SUMMARY is the one this
+# asserts about by name below; the rest are here so the next instance is caught by this list.
+defaults = ('GITHUB_ACTION', 'GITHUB_ACTION_PATH', 'GITHUB_ACTION_REPOSITORY', 'GITHUB_ACTIONS',
+            'GITHUB_ACTOR', 'GITHUB_API_URL', 'GITHUB_BASE_REF', 'GITHUB_ENV', 'GITHUB_EVENT_NAME',
+            'GITHUB_EVENT_PATH', 'GITHUB_GRAPHQL_URL', 'GITHUB_HEAD_REF', 'GITHUB_JOB',
+            'GITHUB_OUTPUT', 'GITHUB_PATH', 'GITHUB_REF', 'GITHUB_REF_NAME', 'GITHUB_REF_PROTECTED',
+            'GITHUB_REF_TYPE', 'GITHUB_REPOSITORY', 'GITHUB_REPOSITORY_ID', 'GITHUB_REPOSITORY_OWNER',
+            'GITHUB_RETENTION_DAYS', 'GITHUB_RUN_ATTEMPT', 'GITHUB_RUN_ID', 'GITHUB_RUN_NUMBER',
+            'GITHUB_SERVER_URL', 'GITHUB_SHA', 'GITHUB_STEP_SUMMARY', 'GITHUB_TRIGGERING_ACTOR',
+            'GITHUB_WORKFLOW', 'GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_WORKSPACE')
+bad = []
+for rel in os.environ['PRV_MANIFESTS'].splitlines():
+    if not rel:
+        continue
+    d = yaml.safe_load(open(os.path.join(root, rel)))
+    for s in d['runs'].get('steps', []):
+        for name, value in (s.get('env') or {}).items():
+            if name not in defaults:
+                continue
+            # An assignment that reads the same name back out of the env context is the blanking one.
+            if re.search(r'\\\$\{\{\s*env\.%s\s*\}\}' % re.escape(name), str(value)):
+                bad.append('%s/%s: %s' % (os.path.dirname(rel), s.get('name'), name))
+print('|'.join(sorted(bad)))
+")
+  assert_eq 'no step re-declares a runner default by reading it back out of the env context' '' "$runner_defaults"
 
   # Every script a step invokes must exist, or the step fails on a missing file at run time. This
   # covers an action reaching into ../lib, the one filesystem assumption nothing else exercises.

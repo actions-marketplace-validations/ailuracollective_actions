@@ -67,8 +67,20 @@ inputs:
     description: 'Comma-separated GitHub logins whose pull requests are exempt from every check in this action. Each entry is matched literally, as a whole login, case-insensitively — never as a pattern. An exempt pull request is reported as skipped, not passed.'
     required: false
     default: ''
+  enable-status-comment:
+    description: 'Keep a single comment on the pull request carrying this action''s current status, updated on every run instead of a new comment per run. Needs `pull-requests: write` on the calling job; set this to `false` to publish nothing.'
+    required: false
+    default: 'true'
+  comment-author:
+    description: 'Login that must own the status comment, compared case-insensitively against the token''s own account. A comment is authored by whoever holds the token that writes it, so the workflow''s own token would post as `github-actions[bot]`; give the report a token for this login in `comment-token` so the comment belongs to the organisation. Nothing is published under a different identity.'
+    required: false
+    default: 'AiluraKitty'
+  comment-token:
+    description: 'Token the status comment is published with, which need not be the one the checks read with. Defaults to `github-token`. Set it when the comment has to be authored by an organisation account: a write-scoped personal access token is then handed to the report alone and never to a check script.'
+    required: false
+    default: ''
   github-token:
-    description: Token used for every API call. Defaults to the workflow's own token.
+    description: Token used for every API call the checks make. Defaults to the workflow's own token.
     required: false
     default: ${{ github.token }}
 
@@ -161,8 +173,25 @@ runs:
       shell: bash
       env:
         RESULTS_DIR: ${{ runner.temp }}/prv-results
-        GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
+        # The sticky comment this action owns. One key per action, and the only thing that tells the
+        # PR policy's comment from the branch validation comment: each action updates its own and
+        # never another's, so a pull request carries one status board per action.
+        PRV_ACTION: 'pull-request'
+        PRV_PUBLISH_COMMENT: ${{ inputs.enable-status-comment }}
+        # Who the comment must be written as. A comment is authored by the owner of the token that
+        # writes it, so this is the input that makes the comment Ailura Kitty's and not the
+        # workflow's; the report refuses to publish under any other identity rather than posting one
+        # the organisation does not own.
+        PRV_COMMENT_AUTHOR: ${{ inputs.comment-author }}
+        # Where the comment lands, and with what. `PR_NUMBER` is not a runner default. The writing
+        # token is a separate input from the reading one because the checks only ever read: it is
+        # the one place a write-scoped token is needed, and it has no reason to be in the hands of
+        # anything that only has to look. Falls back to `github-token`, so a caller that has no
+        # opinion about authorship changes nothing.
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        GH_TOKEN: ${{ inputs.comment-token || inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
         PRV_TITLE: 'Pull request policy'
         PRV_CHECKS: 'linked-issue|type-label|pr-title-length|pr-title-conventional|pr-body-structure'
         PRV_LABELS: 'Linked issue|Type label|Title length|Title is conventional|Body structure'
